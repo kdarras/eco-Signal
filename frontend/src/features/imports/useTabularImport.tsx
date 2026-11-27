@@ -12,7 +12,7 @@ type ImportSubmitResponse = Omit<ImportResponse, "data"> & { data?: ImportResult
 interface UseTabularImportOptions {
     label: string
     config: ImportResourceConfig
-    submit: (file: File, dryRun: boolean, variantKey?: string) => Promise<ImportSubmitResponse>
+    submit: (files: File[], dryRun: boolean, variantKey?: string) => Promise<ImportSubmitResponse>
     onCommitted: () => void
     canBrowse?: boolean
     variants?: Array<{ key: string; label: string; resourceKey: ImportResourceKey }>
@@ -24,15 +24,16 @@ export function useTabularImport({ label, config, submit, onCommitted, variants,
     const [instructionsOpen, setInstructionsOpen] = useState(false)
     const [resultOpen, setResultOpen] = useState(false)
     const [result, setResult] = useState<ImportResult | null>(null)
-    const [selectedFile, setSelectedFile] = useState<File | null>(null)
+    const [selectedFiles, setSelectedFiles] = useState<File[]>([])
     const [activeVariantKey, setActiveVariantKey] = useState<string | null>(null)
     const activeVariant = variants?.find((variant) => variant.key === activeVariantKey)
     const activeConfig: ImportResourceConfig = activeVariant
         ? IMPORT_RESOURCE_CONFIGS[activeVariant.resourceKey] as ImportResourceConfig
         : config
+    const displayLabel = activeConfig.subject || label
 
     const clearTransientState = () => {
-        setSelectedFile(null)
+        setSelectedFiles([])
         setResult(null)
         setResultOpen(false)
         setActiveVariantKey(null)
@@ -46,20 +47,20 @@ export function useTabularImport({ label, config, submit, onCommitted, variants,
 
     const handleImport = async (event: ChangeEvent<HTMLInputElement>) => {
         const input = event.currentTarget
-        const file = input.files?.[0]
-        if (!file || importing) return
-        if (!/\.(csv|txt|json)$/i.test(file.name)) {
+        const files = Array.from(input.files ?? [])
+        if (files.length === 0 || importing) return
+        if (files.some((file) => !/\.(csv|txt|json)$/i.test(file.name))) {
             message.error("Select a CSV, TXT, or JSON file")
             input.value = ""
             return
         }
 
         setImporting(true)
-        setSelectedFile(file)
+        setSelectedFiles(files)
         setResult(null)
-        const hide = message.loading(`Validating ${label}...`, 0)
+        const hide = message.loading(`Validating ${displayLabel}...`, 0)
         try {
-            const response = await submit(file, true, activeVariantKey ?? undefined)
+            const response = await submit(files, true, activeVariantKey ?? undefined)
             if (response.code !== 0 && response.code !== 200) {
                 const reason = response.message || "Import validation failed"
                 message.error(reason)
@@ -84,11 +85,11 @@ export function useTabularImport({ label, config, submit, onCommitted, variants,
     }
 
     const confirmImport = async () => {
-        if (!selectedFile || !result || result.failed > 0 || result.global_errors.length > 0) return
+        if (selectedFiles.length === 0 || !result || result.failed > 0 || result.global_errors.length > 0) return
         setImporting(true)
-        const hide = message.loading(`Importing ${label}...`, 0)
+        const hide = message.loading(`Importing ${displayLabel}...`, 0)
         try {
-            const response = await submit(selectedFile, false, activeVariantKey ?? undefined)
+            const response = await submit(selectedFiles, false, activeVariantKey ?? undefined)
             const data = response.data ?? emptyImportResult(response.message || "Import failed")
             if (!data.committed || data.failed > 0 || data.global_errors.length > 0) {
                 setResult(data)
@@ -123,12 +124,13 @@ export function useTabularImport({ label, config, submit, onCommitted, variants,
                     ref={inputRef}
                     type="file"
                     accept=".csv,.txt,.json,text/csv,text/plain,application/json"
+                    multiple={activeConfig.multiple === true}
                     hidden
                     onChange={(event) => void handleImport(event)}
                 />
                 <CsvImportResultModal
                     open={resultOpen}
-                    label={label}
+                    label={displayLabel}
                     result={result}
                     onClose={clearTransientState}
                     onConfirm={() => void confirmImport()}

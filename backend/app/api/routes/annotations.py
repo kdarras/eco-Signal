@@ -1,5 +1,6 @@
 """标注 API 路由。 / Annotations API routes."""
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile
@@ -58,6 +59,48 @@ async def import_annotations(
     )
     return api_success(message="Import validation completed" if dry_run else "Import completed", data=attach_import_metadata(report, parsed, dry_run=dry_run))
 
+
+
+@router.post("/audacity-imports", summary="导入 Audacity 标注 / Import Audacity Labels")
+async def import_audacity_annotations(
+    session: SessionDep,
+    current_user: CurrentUser,
+    project_id: int = Form(...),
+    collection_id: int = Form(...),
+    dry_run: bool = Form(True),
+    files: list[UploadFile] = File(..., description="Audacity 标签文件 / Audacity label files (TXT or CSV)"),
+) -> Any:
+    """
+    校验或原子导入 Audacity 标签文件。 / Validate or atomically import Audacity label files.
+
+    每个文件的标注会关联到集合中与该文件同名的音频媒体（忽略扩展名），
+    Audacity 标签文本写入 comments 字段。 / Annotations of each file are linked
+    to the audio media sharing its file name (extension ignored) and the
+    Audacity labels are stored in the comments field.
+    """
+    authorization_service.evaluator(session, current_user, project_id).require(
+        AuthorizationAction.MEDIA_CREATE_ANNOTATION,
+        authorization_service.AuthorizationSubject(frozenset({collection_id})),
+        detail="No annotation write permission on collection",
+    )
+    payloads: list[tuple[str, bytes]] = []
+    for file in files:
+        if not file.filename or file.filename != Path(file.filename).name:
+            raise HTTPException(status_code=400, detail="invalid_filename")
+        payloads.append((file.filename, await file.read()))
+    report = tabular_import_service.import_audacity_labels(
+        session,
+        payloads,
+        current_user,
+        project_id,
+        collection_id,
+        dry_run=dry_run,
+    )
+    report.source_format = "audacity_labels"
+    return api_success(
+        message="Import validation completed" if dry_run else "Import completed",
+        data=report,
+    )
 
 
 @router.get(

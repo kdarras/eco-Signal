@@ -43,12 +43,16 @@ export function emptyImportResult(reason: string): ImportResult {
 
 export async function submitTabularImport(
     endpoint: string,
-    file: File,
+    file: File | File[],
     dryRun: boolean,
     fields: Record<string, string | number | boolean | null | undefined> = {},
 ): Promise<ImportResponse> {
     const body = new FormData()
-    body.append("file", file)
+    if (Array.isArray(file)) {
+        file.forEach((item) => body.append("files", item))
+    } else {
+        body.append("file", file)
+    }
     body.append("dry_run", String(dryRun))
     Object.entries(fields).forEach(([key, value]) => {
         if (value !== null && value !== undefined && String(value).trim() !== "") {

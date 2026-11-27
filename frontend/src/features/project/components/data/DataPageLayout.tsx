@@ -298,6 +298,8 @@ export interface TabularImportVariant {
     label: string
     resourceKey: ImportResourceKey
     fields?: Record<string, string | number | boolean | null | undefined>
+    /** Overrides the shared import endpoint for this variant. */
+    endpoint?: string
 }
 
 export interface TableState {
@@ -741,10 +743,11 @@ export function DataPageLayout({
         config: importConfig ? IMPORT_RESOURCE_CONFIGS[importConfig.resourceKey] : IMPORT_RESOURCE_CONFIGS.projects,
         variants: importConfig?.variants,
         canBrowse: !Boolean(importConfig?.disabled),
-        submit: (file, dryRun, variant) => {
+        submit: (files, dryRun, variant) => {
             if (!importConfig) return Promise.reject(new Error("Import is not configured"))
-            const variantFields = importConfig.variants?.find((item) => item.key === variant)?.fields
-            return submitTabularImport(importConfig.endpoint, file, dryRun, { ...importConfig.fields, ...variantFields })
+            const variantConfig = importConfig.variants?.find((item) => item.key === variant)
+            const endpoint = variantConfig?.endpoint ?? importConfig.endpoint
+            return submitTabularImport(endpoint, files, dryRun, { ...importConfig.fields, ...variantConfig?.fields })
         },
         onCommitted: () => setImportRefreshToken((value) => value + 1),
     })

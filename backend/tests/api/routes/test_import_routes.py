@@ -10,6 +10,7 @@ def test_tabular_import_route_coverage() -> None:
         "/api/v1/sites/imports",
         "/api/v1/media/imports",
         "/api/v1/annotations/imports",
+        "/api/v1/annotations/audacity-imports",
         "/api/v1/reviews/imports",
         "/api/v1/index-logs/imports",
         "/api/v1/tasks/imports",

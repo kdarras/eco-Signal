@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import csv
 import json
+import math
 from collections.abc import Callable, Hashable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -12,6 +16,7 @@ from sqlmodel import Field, Session, SQLModel, select
 from app.csv_import import (
     ImportResult,
     ImportRowResult,
+    _decode_import_content,
     effective_header_width,
     ensure_row_width,
     parse_csv,
@@ -396,6 +401,298 @@ def import_annotations(
             annotation_service.validate_annotation_create(session, user, item),
         ),
     )
+
+
+_AUDACITY_IMPORT_EXTENSIONS = {"txt", "csv"}
+_MEDIA_FILE_EXTENSIONS = {
+    ".wav", ".wave", ".aif", ".aiff", ".aifc", ".flac", ".mp3",
+    ".ogg", ".oga", ".opus", ".m4a", ".wma", ".aac",
+}
+_MAX_ANNOTATION_COMMENTS_LENGTH = 500
+_DEFAULT_NYQUIST_HZ = 24000.0
+
+
+class _AudacityLabel:
+    """One parsed Audacity label row awaiting media resolution."""
+
+    __slots__ = ("filename", "row_number", "media_keys", "start", "end", "low", "high", "label")
+
+    def __init__(
+        self,
+        filename: str,
+        row_number: int,
+        media_keys: list[str],
+        start: float,
+        end: float | None,
+        low: float | None,
+        high: float | None,
+        label: str | None,
+    ) -> None:
+        self.filename = filename
+        self.row_number = row_number
+        self.media_keys = media_keys
+        self.start = start
+        self.end = end
+        self.low = low
+        self.high = high
+        self.label = label
+
+
+def _audacity_name_keys(name: str | None) -> set[str]:
+    """Case-folded file-name keys used to link label files to media."""
+    if not name or not name.strip():
+        return set()
+    stem = Path(name.strip()).stem.strip().casefold()
+    keys = {stem} if stem else set()
+    for extension in _MEDIA_FILE_EXTENSIONS:
+        if stem.endswith(extension):
+            stripped = stem[: -len(extension)].strip()
+            if stripped:
+                keys.add(stripped)
+            break
+    return keys
+
+
+def _audacity_timestamp(raw: str, filename: str, row_number: int) -> float:
+    """Parse a numeric seconds value or an HH:MM:SS(.fraction) timestamp."""
+    text = raw.strip()
+    try:
+        if ":" in text:
+            parts = text.split(":")
+            if len(parts) > 3:
+                raise ValueError
+            seconds = 0.0
+            for part in parts:
+                seconds = seconds * 60.0 + float(part)
+        else:
+            seconds = float(text)
+    except ValueError as exc:
+        raise ValueError(f"{filename}: row {row_number}: '{text}' is not a valid time value") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"{filename}: row {row_number}: time values must be non-negative numbers")
+    return seconds
+
+
+def _audacity_frequency(raw: str | None, filename: str, row_number: int, column: str) -> float | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ValueError(f"{filename}: row {row_number}: '{text}' is not a valid {column} value") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{filename}: row {row_number}: {column} must be a non-negative number")
+    return value
+
+
+def _parse_audacity_line(line: str, filename: str, row_number: int) -> _AudacityLabel:
+    """Parse one Audacity label row: start[tab]end[tab]label, start[tab]label, or the spectral 5-column form."""
+    cells = next(csv.reader([line], delimiter="\t"))
+    if len(cells) < 2:
+        cells = next(csv.reader([line]))
+    cells = [cell.strip() for cell in cells]
+    if len(cells) == 1:
+        start_raw, end_raw, low_raw, high_raw, label = cells[0], None, None, None, None
+    elif len(cells) == 2:
+        start_raw, end_raw, low_raw, high_raw, label = cells[0], None, None, None, cells[1]
+    elif len(cells) == 3:
+        start_raw, end_raw, label = cells
+        low_raw = high_raw = None
+    elif len(cells) == 5:
+        start_raw, end_raw, low_raw, high_raw, label = cells
+    else:
+        raise ValueError(
+            f"{filename}: row {row_number}: expected 1, 2, 3, or 5 columns "
+            "(start, [end], [low frequency, high frequency], label)"
+        )
+    start = _audacity_timestamp(start_raw, filename, row_number)
+    end = _audacity_timestamp(end_raw, filename, row_number) if end_raw else None
+    low = _audacity_frequency(low_raw, filename, row_number, "low frequency")
+    high = _audacity_frequency(high_raw, filename, row_number, "high frequency")
+    if end is not None and end < start:
+        raise ValueError(f"{filename}: row {row_number}: the label end time precedes its start time")
+    if (low is None) != (high is None):
+        raise ValueError(f"{filename}: row {row_number}: frequency bounds require both low and high values")
+    if low is not None and high is not None and high < low:
+        raise ValueError(f"{filename}: row {row_number}: the high frequency precedes the low frequency")
+    media_keys = list(_audacity_name_keys(filename))
+    return _AudacityLabel(
+        filename=filename,
+        row_number=row_number,
+        media_keys=media_keys,
+        start=start,
+        end=end,
+        low=low,
+        high=high,
+        label=label or None,
+    )
+
+
+def _audio_media_by_label_key(
+    session: Session,
+    project_id: int,
+    collection_id: int,
+) -> dict[str, Media]:
+    """Index the audio media of one project collection by their file-name keys."""
+    media_by_key: dict[str, Media] = {}
+    media_ids = session.exec(
+        select(MediaCollection.media_id)
+        .join(ProjectCollection, ProjectCollection.collection_id == MediaCollection.collection_id)
+        .where(
+            MediaCollection.collection_id == collection_id,
+            ProjectCollection.project_id == project_id,
+        )
+    ).all()
+    if not media_ids:
+        return media_by_key
+    media_rows = session.exec(
+        select(Media).where(
+            Media.media_id.in_(media_ids),
+            Media.media_type == "audio",
+        )
+    ).all()
+    for media in sorted(media_rows, key=lambda media: media.media_id):
+        for key in _audacity_name_keys(media.filename) | _audacity_name_keys(media.name):
+            media_by_key.setdefault(key, media)
+    return media_by_key
+
+
+def _audacity_label_bounds(item: _AudacityLabel, media: Media) -> tuple[float, float, float, float]:
+    """Resolve annotation bounds; point labels get zero duration and unlabeled rows get the full band."""
+    end = item.end if item.end is not None else item.start
+    duration = media.audio_setting.duration_s if media.audio_setting else None
+    if duration is not None and duration > 0:
+        if item.start > duration + 1e-6:
+            raise ValueError(f"{item.filename}: row {item.row_number}: the label starts after the end of the media")
+        end = min(end, duration)
+    if item.low is not None and item.high is not None:
+        min_y, max_y = item.low, item.high
+    else:
+        sampling_rate_hz = media.audio_setting.sampling_rate_hz if media.audio_setting else None
+        max_y = sampling_rate_hz / 2.0 if sampling_rate_hz and sampling_rate_hz > 0 else _DEFAULT_NYQUIST_HZ
+        min_y, max_y = 0.0, max_y
+    return item.start, end, min_y, max_y
+
+
+def import_audacity_labels(
+    session: Session,
+    files: list[tuple[str, bytes]],
+    user: User,
+    project_id: int,
+    collection_id: int,
+    *,
+    dry_run: bool,
+) -> ImportResult:
+    """
+    Import Audacity label files as annotations.
+
+    Each label file is matched to the audio media of the collection that shares
+    its file name (ignoring the file extension). The label text becomes the
+    annotation comments. Region labels use the start/end times, point labels
+    (single timestamp) produce zero-duration annotations, and the optional
+    low/high frequency columns define the frequency bounds (full audio band
+    otherwise). Like the other tabular imports, validation is atomic: any
+    failed row prevents any write.
+    """
+    report = ImportResult(delimiter="\t", dry_run=dry_run)
+    parsed: list[_AudacityLabel] = []
+    row_number = 0
+    for filename, content in files:
+        extension = Path(filename).suffix.lower().lstrip(".")
+        if extension not in _AUDACITY_IMPORT_EXTENSIONS:
+            report.global_errors.append(f"{filename}: unsupported file type; use Audacity label TXT or CSV files")
+            continue
+        try:
+            text = _decode_import_content(content).strip()
+        except HTTPException as exc:
+            report.global_errors.append(f"{filename}: {exc.detail}")
+            continue
+        if not text:
+            report.global_errors.append(f"{filename}: no labels found")
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            row_number += 1
+            try:
+                parsed.append(_parse_audacity_line(line, filename, row_number))
+            except ValueError as exc:
+                report.rows.append(ImportRowResult(row_number=row_number, status="failed", reason=str(exc)))
+
+    media_by_key = _audio_media_by_label_key(session, project_id, collection_id) if parsed else {}
+    results = {row.row_number: row for row in report.rows}
+    accepted: list[tuple[Media, _AudacityLabel, float, float, float, float]] = []
+    seen: set[tuple[int, float, float, float, float, str | None]] = set()
+    for item in parsed:
+        result = results.get(item.row_number)
+        if result is None:
+            result = ImportRowResult(row_number=item.row_number, status="succeeded")
+            report.rows.append(result)
+            results[item.row_number] = result
+        media = next(
+            (media_by_key[key] for key in item.media_keys if key in media_by_key),
+            None,
+        )
+        if media is None:
+            result.status = "failed"
+            result.reason = (
+                f"{item.filename}: no audio media named '{Path(item.filename).stem}' "
+                "was found in the selected collection"
+            )
+            continue
+        try:
+            min_x, max_x, min_y, max_y = _audacity_label_bounds(item, media)
+        except ValueError as exc:
+            result.status = "failed"
+            result.reason = str(exc)
+            continue
+        if item.label and len(item.label) > _MAX_ANNOTATION_COMMENTS_LENGTH:
+            item.label = item.label[:_MAX_ANNOTATION_COMMENTS_LENGTH]
+        comments = item.label
+        dedup_key = (media.media_id, min_x, max_x, min_y, max_y, comments)
+        if dedup_key in seen:
+            result.status = "skipped"
+            result.reason = "Duplicate label in file"
+            continue
+        seen.add(dedup_key)
+        accepted.append((media, item, min_x, max_x, min_y, max_y))
+
+    report.finalize()
+    if report.failed or report.global_errors:
+        if not dry_run:
+            report.reject_candidates()
+        return report
+    if dry_run:
+        return report.finalize()
+
+    try:
+        creation_date = datetime.now(UTC)
+        session.add_all(
+            Annotation(
+                media_id=media.media_id,
+                min_x=min_x,
+                max_x=max_x,
+                min_y=min_y,
+                max_y=max_y,
+                object_type=None,
+                reference=False,
+                comments=item.label,
+                individual_num=1,
+                creator_id=user.user_id,
+                creator_type="user",
+                creation_date=creation_date,
+            )
+            for media, item, min_x, max_x, min_y, max_y in accepted
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        report.global_errors.append("No data was written because the import transaction failed")
+        report.reject_candidates()
+        return report
+    report.committed = True
+    return report.finalize()
 
 
 def import_reviews(
