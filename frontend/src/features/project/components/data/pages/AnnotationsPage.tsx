@@ -371,6 +371,7 @@ export function AnnotationsPage() {
                     variants: [
                         { key: "audio", label: "Audio Annotations", resourceKey: "audioAnnotations", fields: { media_type: "audio" } },
                         { key: "photo", label: "Photo Annotations", resourceKey: "photoAnnotations", fields: { media_type: "photo" } },
+                        { key: "audacity", label: "Audacity Annotations", resourceKey: "audacityAnnotations", endpoint: "/v1/annotations/audacity-imports" },
                     ],
                     importOnly: true,
                     fields: { project_id: currentProjectId, collection_id: currentCollectionId },

@@ -15,6 +15,8 @@ export interface ImportResourceConfig {
     combinedImport?: boolean
     instructionsIntro?: string
     instructionsUploadPrompt?: string
+    /** Allows selecting several files at once (one record set per file). */
+    multiple?: boolean
 }
 
 export type ImportResourceKey = keyof typeof IMPORT_RESOURCE_CONFIGS
@@ -165,6 +167,23 @@ export const IMPORT_RESOURCE_CONFIGS = {
             field("reference", "optional boolean, default false", "Reference annotation"), field("comments", "optional", "Annotation comments"),
             field("creator_type", "optional, default user", "Creator category"),
         ],
+    },
+    audacityAnnotations: {
+        subject: "Audacity annotation",
+        templateFileName: "audacity_annotations_template.csv",
+        template: "start,end,low_frequency,high_frequency,label\n0.5,2.3,,,Bird call\n3.1,4.5,1200,3400,Crustacean snaps\n",
+        example: { start: 0.5, end: 2.3, low_frequency: null, high_frequency: null, label: "Bird call" },
+        additionalExample: { start: 3.1, end: 4.5, low_frequency: 1200, high_frequency: 3400, label: "Crustacean snaps" },
+        fields: [
+            field("start", "required number or HH:MM:SS", "Label start time in seconds"),
+            field("end", "optional number", "Label end time in seconds; rows without an end create zero-duration point annotations"),
+            field("low_frequency", "optional number", "Minimum frequency in Hz (Audacity spectral selection labels)"),
+            field("high_frequency", "optional number", "Maximum frequency in Hz (Audacity spectral selection labels)"),
+            field("label", "optional text, max 500 characters", "Audacity label stored in the annotation comments"),
+        ],
+        instructionsIntro: "Annotations of each uploaded file will be linked to the audio media that has the same file name (ignoring the file extension). The Audacity labels will be inserted into the Comments field. Region labels use their start and end times; point labels (a single timestamp) create zero-duration annotations. When the low/high frequency columns are present they define the annotation frequency bounds; otherwise the full audio band is used.",
+        instructionsUploadPrompt: "Select one or more Audacity label files (TXT or CSV) to upload to the current collection.",
+        multiple: true,
     },
     reviews: {
         subject: "Review",

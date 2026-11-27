@@ -15,7 +15,7 @@ export function useSettingsCsvImport(
     const controller = useTabularImport({
         label: IMPORT_RESOURCE_CONFIGS[resourceKey].subject.toLowerCase(),
         config: IMPORT_RESOURCE_CONFIGS[resourceKey],
-        submit: (file, dryRun) => submit(file, dryRun),
+        submit: (files, dryRun) => submit(files[0]!, dryRun),
         onCommitted: onSuccess,
     })
 
